@@ -1,0 +1,150 @@
+---
+# ============================================================
+# Ansible Playbook: Docker 节点安全基线加固
+# 对应简历: 阿里云容器集群管控 - 个人工作 3
+# 用途: 批量下发 CIS 安全基线到所有 Docker 节点
+# ============================================================
+
+- name: Docker 节点安全基线加固
+  hosts: docker_nodes
+  become: yes
+
+  tasks:
+    # ==================== SSH 安全 ====================
+    - name: "[SSH] 禁用 root SSH 密码登录"
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin without-password'
+
+    - name: "[SSH] 禁用空密码"
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitEmptyPasswords'
+        line: 'PermitEmptyPasswords no'
+
+    - name: "[SSH] 设置 SSH 空闲超时"
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^ClientAliveInterval'
+        line: 'ClientAliveInterval 300'
+
+    - name: "[SSH] 重启 sshd 使配置生效"
+      systemd:
+        name: sshd
+        state: restarted
+      ignore_errors: yes
+
+    # ==================== 密码策略 ====================
+    - name: "[PAM] 设置密码最大有效期 90 天"
+      lineinfile:
+        path: /etc/login.defs
+        regexp: '^PASS_MAX_DAYS'
+        line: 'PASS_MAX_DAYS 90'
+
+    - name: "[PAM] 设置密码最小长度 8"
+      lineinfile:
+        path: /etc/login.defs
+        regexp: '^PASS_MIN_LEN'
+        line: 'PASS_MIN_LEN 8'
+
+    # ==================== 内核安全参数 ====================
+    - name: "[KERNEL] 配置内核安全参数"
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { name: 'net.ipv4.tcp_syncookies', value: '1' }         # 防 SYN flood
+        - { name: 'net.ipv4.ip_forward', value: '0' }             # 禁止 IP 转发
+        - { name: 'net.ipv4.conf.all.accept_source_route', value: '0' }
+        - { name: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+        - { name: 'net.ipv4.conf.all.send_redirects', value: '0' }
+        - { name: 'net.ipv4.icmp_echo_ignore_broadcasts', value: '1' }
+        - { name: 'kernel.dmesg_restrict', value: '1' }
+        - { name: 'kernel.kptr_restrict', value: '1' }
+
+    # ==================== Docker 安全检查 ====================
+    - name: "[DOCKER] 检查 Docker 运行状态"
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: "[DOCKER] 检查 daemon.json 配置"
+      shell: cat /etc/docker/daemon.json 2>/dev/null
+      register: docker_daemon_config
+      changed_when: false
+
+    - name: "[DOCKER] 输出 daemon.json"
+      debug:
+        var: docker_daemon_config.stdout_lines
+
+    - name: "[DOCKER] 检查运行中的容器"
+      shell: docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+      register: docker_ps
+      changed_when: false
+
+    - name: "[DOCKER] 输出容器状态"
+      debug:
+        var: docker_ps.stdout_lines
+
+    - name: "[DOCKER] 检查容器安全配置"
+      shell: |
+        for c in $(docker ps -q); do
+          name=$(docker inspect --format '{{.Name}}' $c | sed 's/\///')
+          cap=$(docker inspect --format '{{.HostConfig.CapDrop}}' $c)
+          ro=$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' $c)
+          mem=$(docker inspect --format '{{.HostConfig.Memory}}' $c)
+          echo "$name: CapDrop=$cap, ReadOnly=$ro, MemLimit=$mem"
+        done
+      register: container_security
+      changed_when: false
+
+    - name: "[DOCKER] 输出容器安全检查结果"
+      debug:
+        var: container_security.stdout_lines
+
+    # ==================== 端口检查 ====================
+    - name: "[PORT] 检查对外监听端口"
+      shell: ss -tlnp 2>/dev/null | grep -v '127.0.0.1\|::1'
+      register: open_ports
+      changed_when: false
+
+    - name: "[PORT] 输出高危端口暴露情况"
+      debug:
+        var: open_ports.stdout_lines
+
+    # ==================== 审计检查 ====================
+    - name: "[AUDIT] 检查 auditd 状态"
+      systemd:
+        name: auditd
+        state: started
+        enabled: yes
+      ignore_errors: yes
+
+    - name: "[AUDIT] 检查 Docker 审计规则"
+      shell: auditctl -l 2>/dev/null | grep docker
+      register: audit_rules
+      changed_when: false
+
+    - name: "[AUDIT] 输出审计规则"
+      debug:
+        var: audit_rules.stdout_lines
+
+    # ==================== 汇总报告 ====================
+    - name: "[REPORT] 生成安全检查报告"
+      copy:
+        content: |
+          ========================================
+          安全基线加固报告
+          执行时间: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          目标主机: {{ inventory_hostname }}
+          ========================================
+          Docker 状态: 运行中
+          内核参数加固: 8 项
+          SSH 加固: 3 项
+          审计规则: {{ audit_rules.stdout_lines | length }}
+          高危端口: {{ open_ports.stdout_lines | length }}
+        dest: /root/security_report_{{ inventory_hostname }}.txt
